@@ -1763,7 +1763,27 @@ void app_main(void)
 
     ESP_ERROR_CHECK(bsp_i2c_init());
 
-    lv_display_t *display = bsp_display_start();
+    /*
+     * GIF 单帧解码 + 整屏 flush 的耗时会超过帧定时器周期，lv_timer_handler()
+     * 因此总是返回 0。适配器默认 task_min_delay_ms=1，在 CONFIG_FREERTOS_HZ=100
+     * 下 pdMS_TO_TICKS(1)==0，vTaskDelay(0) 不会让出 CPU，高优先级(6)的 lvgl
+     * 任务将饿死 CPU0 上的 app_main(优先级1) 与 IDLE0：按键事件入队后永远无人
+     * 处理，并触发 task_wdt 风暴。将最小休眠提高到 10ms（100Hz 下恰好 1 tick），
+     * 保证每轮 LVGL 循环真实阻塞一次，事件循环与看门狗恢复正常。
+     */
+    bsp_display_cfg_t disp_cfg = {
+        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+        .rotation = ESP_LV_ADAPTER_ROTATE_0,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
+        .touch_flags = {
+            .swap_xy = 0,
+            .mirror_x = 0,
+            .mirror_y = 0,
+        },
+    };
+    disp_cfg.lv_adapter_cfg.task_min_delay_ms = 10;
+
+    lv_display_t *display = bsp_display_start_with_config(&disp_cfg);
     if (display == NULL) {
         ESP_LOGE(TAG, "Failed to initialize display");
         return;
