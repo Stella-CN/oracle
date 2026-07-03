@@ -29,7 +29,8 @@
 static const char *TAG = "gif_player";
 
 #define APP_LCD_BRIGHTNESS_PERCENT 80
-#define APP_SD_GIF_DIR             "/sdcard/assets/gif"
+#define APP_SD_GIF_SUBDIR          "assets/gif"
+#define APP_SD_GIF_DIR             BSP_SD_MOUNT_POINT "/" APP_SD_GIF_SUBDIR
 #define APP_LVGL_FS_LETTER         'S'
 #define APP_LVGL_LOCK_TIMEOUT_MS   -1
 #define APP_LVGL_STDIO_PATH_MAX    256
@@ -52,12 +53,23 @@ typedef struct {
     size_t size;
 } app_gif_t;
 
+typedef enum {
+    APP_MEDIA_OK = 0,
+    APP_MEDIA_SD_MOUNT_FAILED,
+    APP_MEDIA_GIF_DIR_MISSING,
+    APP_MEDIA_NO_GIFS,
+    APP_MEDIA_SCAN_FAILED,
+} app_media_state_t;
+
 static QueueHandle_t s_evt_queue;
 static app_gif_t *s_gifs;
 static lv_obj_t *s_gif;
 static lv_obj_t *s_name_label;
 static int s_cur_index;
 static int s_total;
+static app_media_state_t s_media_state = APP_MEDIA_SD_MOUNT_FAILED;
+static esp_err_t s_last_sd_err = ESP_OK;
+static int s_last_scan_errno;
 
 /* ---------------------------------------------------------------------------
  * GIF 列表扫描
@@ -154,9 +166,20 @@ static esp_err_t scan_sd_gifs(void)
 {
     clear_gif_list();
 
+    errno = 0;
     DIR *dir = opendir(APP_SD_GIF_DIR);
     if (dir == NULL) {
-        ESP_LOGE(TAG, "Failed to open GIF directory '%s': errno=%d", APP_SD_GIF_DIR, errno);
+        s_last_scan_errno = errno;
+        if (s_last_scan_errno == ENOENT) {
+            s_media_state = APP_MEDIA_GIF_DIR_MISSING;
+            ESP_LOGE(TAG, "GIF directory missing: %s (create %s at SD card root)",
+                     APP_SD_GIF_DIR, APP_SD_GIF_SUBDIR);
+            return ESP_ERR_NOT_FOUND;
+        }
+
+        s_media_state = APP_MEDIA_SCAN_FAILED;
+        ESP_LOGE(TAG, "Failed to open GIF directory '%s': errno=%d (%s)",
+                 APP_SD_GIF_DIR, s_last_scan_errno, strerror(s_last_scan_errno));
         return ESP_FAIL;
     }
 
@@ -191,35 +214,132 @@ static esp_err_t scan_sd_gifs(void)
     closedir(dir);
 
     if (ret != ESP_OK) {
+        s_media_state = APP_MEDIA_SCAN_FAILED;
         clear_gif_list();
         return ret;
     }
 
     if (s_total == 0) {
+        s_media_state = APP_MEDIA_NO_GIFS;
         ESP_LOGW(TAG, "No GIF files found in %s", APP_SD_GIF_DIR);
         return ESP_ERR_NOT_FOUND;
     }
 
     qsort(s_gifs, (size_t)s_total, sizeof(*s_gifs), compare_gif_by_name);
+    s_media_state = APP_MEDIA_OK;
     ESP_LOGI(TAG, "Found %d GIF file(s) in %s", s_total, APP_SD_GIF_DIR);
     return ESP_OK;
 }
 
+static esp_err_t mount_sdmmc_with_width(uint8_t bus_width)
+{
+    sdmmc_host_t host = {0};
+    sdmmc_slot_config_t slot = {0};
+    const esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 10,
+        .allocation_unit_size = 16 * 1024,
+    };
+
+    bsp_sdcard_get_sdmmc_host(SDMMC_HOST_SLOT_0, &host);
+    bsp_sdcard_sdmmc_get_slot(SDMMC_HOST_SLOT_0, &slot);
+    slot.width = bus_width;
+
+    bsp_sdcard_cfg_t cfg = {
+        .mount = &mount_config,
+        .host = &host,
+        .slot.sdmmc = &slot,
+    };
+
+    return bsp_sdcard_sdmmc_mount(&cfg);
+}
+
+static esp_err_t mount_sd_card(void)
+{
+    esp_err_t err = mount_sdmmc_with_width(4);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "SD card mounted at %s (SDMMC 4-bit)", BSP_SD_MOUNT_POINT);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "SDMMC 4-bit mount failed: %s, retrying 1-bit", esp_err_to_name(err));
+
+    err = mount_sdmmc_with_width(1);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "SD card mounted at %s (SDMMC 1-bit fallback)", BSP_SD_MOUNT_POINT);
+        return ESP_OK;
+    }
+
+    s_last_sd_err = err;
+    s_media_state = APP_MEDIA_SD_MOUNT_FAILED;
+    ESP_LOGE(TAG,
+             "Failed to mount SD card: %s. Use a FAT32-formatted card; "
+             "exFAT is not enabled in this firmware. Expected directory: /%s",
+             esp_err_to_name(err), APP_SD_GIF_SUBDIR);
+    return err;
+}
+
 static esp_err_t mount_sd_and_scan_gifs(void)
 {
-    esp_err_t err = bsp_sdcard_mount();
+    s_media_state = APP_MEDIA_SD_MOUNT_FAILED;
+    s_last_sd_err = ESP_OK;
+    s_last_scan_errno = 0;
+
+    esp_err_t err = mount_sd_card();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(err));
         return err;
     }
 
-    ESP_LOGI(TAG, "SD card mounted at /sdcard");
+    s_media_state = APP_MEDIA_SCAN_FAILED;
     return scan_sd_gifs();
 }
 
 /* ---------------------------------------------------------------------------
  * UI / GIF 显示
  * ------------------------------------------------------------------------- */
+
+static const char *media_status_text(void)
+{
+    switch (s_media_state) {
+    case APP_MEDIA_OK:
+        return "ready";
+    case APP_MEDIA_SD_MOUNT_FAILED:
+        return "SD mount failed: use FAT32";
+    case APP_MEDIA_GIF_DIR_MISSING:
+        return "missing /assets/gif";
+    case APP_MEDIA_NO_GIFS:
+        return "no GIF in /assets/gif";
+    case APP_MEDIA_SCAN_FAILED:
+    default:
+        return "SD scan failed";
+    }
+}
+
+static void print_media_status(void)
+{
+    dbg_console_printf("%s\n", media_status_text());
+
+    switch (s_media_state) {
+    case APP_MEDIA_SD_MOUNT_FAILED:
+        dbg_console_printf("last SD error: %s\n", esp_err_to_name(s_last_sd_err));
+        dbg_console_printf("format the SD card as FAT32; exFAT is not enabled in this firmware\n");
+        break;
+    case APP_MEDIA_GIF_DIR_MISSING:
+        dbg_console_printf("create %s at the SD card root and copy .gif files into it\n",
+                           APP_SD_GIF_SUBDIR);
+        break;
+    case APP_MEDIA_NO_GIFS:
+        dbg_console_printf("copy .gif files into %s\n", APP_SD_GIF_DIR);
+        break;
+    case APP_MEDIA_SCAN_FAILED:
+        dbg_console_printf("scan errno: %d (%s)\n",
+                           s_last_scan_errno, strerror(s_last_scan_errno));
+        break;
+    case APP_MEDIA_OK:
+    default:
+        break;
+    }
+}
 
 static void set_status_text_locked(const char *text)
 {
@@ -251,7 +371,7 @@ static void show_gif(int index)
 {
     if (s_total <= 0) {
         ESP_LOGW(TAG, "No GIF files loaded");
-        set_status_text("no GIF found");
+        set_status_text("%s", media_status_text());
         return;
     }
 
@@ -327,7 +447,7 @@ static int cmd_next(int argc, char **argv)
     (void)argc;
     (void)argv;
     if (s_total <= 0) {
-        dbg_console_printf("no GIF files loaded\n");
+        print_media_status();
         return 1;
     }
     post_event(APP_EVT_NEXT, 0);
@@ -339,7 +459,7 @@ static int cmd_prev(int argc, char **argv)
     (void)argc;
     (void)argv;
     if (s_total <= 0) {
-        dbg_console_printf("no GIF files loaded\n");
+        print_media_status();
         return 1;
     }
     post_event(APP_EVT_PREV, 0);
@@ -349,7 +469,7 @@ static int cmd_prev(int argc, char **argv)
 static int cmd_goto(int argc, char **argv)
 {
     if (s_total <= 0) {
-        dbg_console_printf("no GIF files loaded\n");
+        print_media_status();
         return 1;
     }
 
@@ -379,7 +499,7 @@ static int cmd_list(int argc, char **argv)
     (void)argc;
     (void)argv;
     if (s_total <= 0) {
-        dbg_console_printf("no GIF files loaded from %s\n", APP_SD_GIF_DIR);
+        print_media_status();
         return 1;
     }
 
@@ -442,10 +562,9 @@ void app_main(void)
     esp_err_t err = mount_sd_and_scan_gifs();
     if (err == ESP_OK) {
         show_gif(0);
-    } else if (err == ESP_ERR_NOT_FOUND) {
-        set_status_text("no GIF found");
     } else {
-        set_status_text("SD mount/scan failed");
+        ESP_LOGW(TAG, "GIF source unavailable: %s", media_status_text());
+        set_status_text("%s", media_status_text());
     }
 
     static button_handle_t buttons[BSP_BUTTON_NUM];
