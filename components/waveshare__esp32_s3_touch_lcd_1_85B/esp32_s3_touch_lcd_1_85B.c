@@ -894,7 +894,7 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
     *ret_io = NULL;
 
     // reconfig spi bus
-    io_config.pclk_hz = 80*1000*1000;
+    io_config.pclk_hz = BSP_LCD_PIXEL_CLOCK_HZ;
     ESP_GOTO_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)BSP_LCD_SPI_NUM, &io_config, ret_io), err, TAG, "New panel IO failed");
     
     // Check register values and configure accordingly
@@ -992,7 +992,7 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
                 BSP_LCD_H_RES, BSP_LCD_V_RES,    
                 ESP_LV_ADAPTER_ROTATE_0,     
                 BSP_LCD_TE,                         
-                80 * 1000 * 1000,          
+                BSP_LCD_PIXEL_CLOCK_HZ,          
                 4,                       
                 BSP_LCD_BITS_PER_PIXEL      
                 
@@ -1007,7 +1007,9 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
             .hor_res = BSP_LCD_H_RES,
             .ver_res = BSP_LCD_V_RES,
             .buffer_height = 50,
-            .use_psram = true,
+            /* Keep LVGL draw buffers in internal SRAM: SPI DMA reading from PSRAM can
+             * underflow (snow on screen) when PSRAM bandwidth is consumed by XIP + app. */
+            .use_psram = false,
             .enable_ppa_accel = false,
             .require_double_buffer = true,
         },

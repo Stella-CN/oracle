@@ -466,7 +466,14 @@ esp_err_t get_file_list_by_ext(const char *dir_path, const char *extension, gene
  *
  * Display's backlight must be enabled explicitly by calling bsp_display_backlight_on()
  **************************************************************************************************/
-#define BSP_LCD_PIXEL_CLOCK_HZ     (80 * 1000 * 1000)
+/*
+ * QSPI bus clock for ST77916.
+ * NOTE: 80 MHz causes "spi_master: DMA TX underflow" (snow/garbage on screen) when the
+ * frame buffer lives in PSRAM and PSRAM bandwidth is shared with XIP (SPIRAM_FETCH_INSTRUCTIONS /
+ * SPIRAM_RODATA) plus application traffic (e.g. GIF decoding). 40 MHz still yields ~38 fps full
+ * frame updates on 360x360 RGB565 and leaves enough PSRAM bandwidth margin.
+ */
+#define BSP_LCD_PIXEL_CLOCK_HZ     (40 * 1000 * 1000)
 #define BSP_LCD_SPI_NUM            (SPI2_HOST)
 
 #if (BSP_CONFIG_NO_GRAPHIC_LIB == 0)

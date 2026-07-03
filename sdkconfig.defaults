@@ -14,3 +14,5 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # CONFIG_LV_BUILD_EXAMPLES is not set
 # CONFIG_LV_BUILD_DEMOS is not set
 CONFIG_LV_USE_GIF=y
+# TE full-frame mode deadlocks on flush error and starves PSRAM bandwidth; use partial refresh
+# CONFIG_BSP_LCD_TE_RESISTANT is not set
