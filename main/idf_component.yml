@@ -2,5 +2,3 @@ dependencies:
   waveshare/esp32_s3_touch_lcd_1_85B:
     version: "*"
     override_path: ../components/waveshare__esp32_s3_touch_lcd_1_85B
-  espressif/esp_mmap_assets: "*"
-  espressif/esp_lv_fs: "*"

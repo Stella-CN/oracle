@@ -169,6 +169,16 @@ esp_err_t dbg_console_start(const dbg_console_config_t *config)
         register_system_cmds();
     }
 
+    if (config->register_user_cmds != NULL) {
+        err = config->register_user_cmds(config->user_ctx);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register user commands: %s", esp_err_to_name(err));
+            s_repl->del(s_repl);
+            s_repl = NULL;
+            return err;
+        }
+    }
+
     err = esp_console_start_repl(s_repl);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start REPL: %s", esp_err_to_name(err));
