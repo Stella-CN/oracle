@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,13 +23,9 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "driver/sdmmc_host.h"
-#include "diskio_impl.h"
 #include "esp_heap_caps.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
 
 #include "bsp/esp-bsp.h"
 #include "libs/gif/AnimatedGIF.h"
@@ -43,20 +40,9 @@ static const char *TAG = "gif_player";
 #define APP_SD_GIF_DIR             BSP_SD_MOUNT_POINT "/" APP_SD_GIF_SUBDIR
 #define APP_LVGL_LOCK_TIMEOUT_MS   -1
 #define APP_SCAN_PATH_MAX          320
-#define APP_SD_SECTOR_SIZE         512U
-#define APP_FATFS_DRIVE_STR_MAX    3U
 #define APP_SD_HINT_MAX            160U
 #define APP_GIF_LOAD_CHUNK_SIZE    (16U * 1024U)
 #define APP_GIF_MIN_FRAME_DELAY_MS 20U
-#define APP_MBR_PART_TABLE_OFFSET  446U
-#define APP_MBR_PART_ENTRY_SIZE    16U
-#define APP_MBR_PART_TYPE_OFFSET   4U
-#define APP_MBR_PART_LBA_OFFSET    8U
-#define APP_MBR_PART_SIZE_OFFSET   12U
-#define APP_MBR_SIGNATURE_OFFSET   510U
-#define APP_GPT_HEADER_LBA         1U
-#define APP_GPT_MAX_SCAN_ENTRIES   128U
-#define APP_GPT_ENTRY_SIZE         128U
 
 typedef enum {
     APP_EVT_NEXT,
@@ -82,38 +68,6 @@ typedef enum {
     APP_MEDIA_NO_GIFS,
     APP_MEDIA_SCAN_FAILED,
 } app_media_state_t;
-
-typedef enum {
-    APP_SD_LAYOUT_UNKNOWN = 0,
-    APP_SD_LAYOUT_SUPER_FLOPPY,
-    APP_SD_LAYOUT_MBR,
-    APP_SD_LAYOUT_GPT,
-} app_sd_layout_t;
-
-typedef enum {
-    APP_SD_FS_UNKNOWN = 0,
-    APP_SD_FS_FAT,
-    APP_SD_FS_FAT32,
-    APP_SD_FS_EXFAT,
-} app_sd_fs_t;
-
-typedef struct {
-    app_sd_layout_t layout;
-    app_sd_fs_t fs_type;
-    uint32_t start_lba;
-    uint32_t sector_count;
-    uint8_t partition_index;
-    uint8_t partition_type;
-} app_sd_volume_t;
-
-typedef struct {
-    sdmmc_card_t *card;
-    BYTE pdrv;
-    uint32_t start_lba;
-    uint32_t sector_count;
-    uint16_t sector_size;
-    bool disk_status_check;
-} app_sd_disk_t;
 
 typedef struct {
     int x;
@@ -152,15 +106,8 @@ static int s_total;
 static app_media_state_t s_media_state = APP_MEDIA_SD_MOUNT_FAILED;
 static esp_err_t s_last_sd_err = ESP_OK;
 static int s_last_scan_errno;
-static FRESULT s_last_fresult = FR_OK;
 static char s_last_sd_hint[APP_SD_HINT_MAX];
-static app_sd_volume_t s_sd_volume;
-static app_sd_disk_t s_sd_disk = {
-    .pdrv = FF_DRV_NOT_USED,
-};
-static FATFS *s_sd_fs;
-static sdmmc_card_t *s_sd_card;
-static char s_sd_drive[APP_FATFS_DRIVE_STR_MAX];
+static uint8_t s_sd_bus_width;
 
 /* ---------------------------------------------------------------------------
  * GIF 列表扫描
@@ -324,612 +271,9 @@ static void set_last_sd_hint(const char *fmt, ...)
     va_end(args);
 }
 
-static const char *sd_layout_name(app_sd_layout_t layout)
-{
-    switch (layout) {
-    case APP_SD_LAYOUT_SUPER_FLOPPY:
-        return "SFD";
-    case APP_SD_LAYOUT_MBR:
-        return "MBR";
-    case APP_SD_LAYOUT_GPT:
-        return "GPT";
-    case APP_SD_LAYOUT_UNKNOWN:
-    default:
-        return "unknown";
-    }
-}
-
-static const char *sd_fs_name(app_sd_fs_t fs_type)
-{
-    switch (fs_type) {
-    case APP_SD_FS_FAT32:
-        return "FAT32";
-    case APP_SD_FS_FAT:
-        return "FAT";
-    case APP_SD_FS_EXFAT:
-        return "exFAT";
-    case APP_SD_FS_UNKNOWN:
-    default:
-        return "unknown";
-    }
-}
-
-static uint16_t read_le16(const uint8_t *data)
-{
-    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-}
-
-static uint32_t read_le32(const uint8_t *data)
-{
-    return (uint32_t)data[0] |
-           ((uint32_t)data[1] << 8) |
-           ((uint32_t)data[2] << 16) |
-           ((uint32_t)data[3] << 24);
-}
-
-static uint64_t read_le64(const uint8_t *data)
-{
-    return (uint64_t)read_le32(data) | ((uint64_t)read_le32(data + 4) << 32);
-}
-
-static bool is_power_of_two_u32(uint32_t value)
-{
-    return value != 0 && (value & (value - 1U)) == 0;
-}
-
-static bool has_boot_sector_signature(const uint8_t *sector)
-{
-    return read_le16(sector + APP_MBR_SIGNATURE_OFFSET) == 0xAA55;
-}
-
-static app_sd_fs_t detect_fat_vbr(const uint8_t *sector)
-{
-    if (!has_boot_sector_signature(sector)) {
-        return APP_SD_FS_UNKNOWN;
-    }
-
-    if (memcmp(sector + 3, "EXFAT   ", 8) == 0) {
-        return APP_SD_FS_EXFAT;
-    }
-
-    const uint8_t jump = sector[0];
-    if (jump != 0xEB && jump != 0xE9 && jump != 0xE8) {
-        return APP_SD_FS_UNKNOWN;
-    }
-
-    const uint16_t bytes_per_sector = read_le16(sector + 11);
-    const uint8_t sectors_per_cluster = sector[13];
-    const uint16_t reserved_sectors = read_le16(sector + 14);
-    const uint8_t fat_count = sector[16];
-    const uint16_t root_entry_count = read_le16(sector + 17);
-    const uint16_t fat16_sectors = read_le16(sector + 22);
-    const uint32_t fat32_sectors = read_le32(sector + 36);
-
-    if (!is_power_of_two_u32(bytes_per_sector) ||
-        bytes_per_sector < APP_SD_SECTOR_SIZE ||
-        bytes_per_sector > 4096 ||
-        !is_power_of_two_u32(sectors_per_cluster) ||
-        reserved_sectors == 0 ||
-        (fat_count != 1 && fat_count != 2)) {
-        return APP_SD_FS_UNKNOWN;
-    }
-
-    if (memcmp(sector + 82, "FAT32   ", 8) == 0 ||
-        (root_entry_count == 0 && fat32_sectors != 0)) {
-        return APP_SD_FS_FAT32;
-    }
-
-    if (memcmp(sector + 54, "FAT", 3) == 0 ||
-        (root_entry_count != 0 && fat16_sectors != 0)) {
-        return APP_SD_FS_FAT;
-    }
-
-    return APP_SD_FS_UNKNOWN;
-}
-
-static bool partition_type_is_empty(const uint8_t *entry)
-{
-    for (int i = 0; i < 16; i++) {
-        if (entry[i] != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static esp_err_t read_sd_sector(sdmmc_card_t *card, uint32_t sector, uint8_t *buffer)
-{
-    if (card->csd.sector_size != APP_SD_SECTOR_SIZE) {
-        set_last_sd_hint("unsupported SD sector size: %u bytes",
-                         (unsigned)card->csd.sector_size);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    esp_err_t err = sdmmc_read_sectors(card, buffer, sector, 1);
-    if (err != ESP_OK) {
-        set_last_sd_hint("failed to read SD sector %" PRIu32 ": %s",
-                         sector, esp_err_to_name(err));
-    }
-    return err;
-}
-
-static esp_err_t probe_volume_at(sdmmc_card_t *card,
-                                 uint64_t start_lba,
-                                 uint64_t sector_count,
-                                 app_sd_layout_t layout,
-                                 uint8_t partition_index,
-                                 uint8_t partition_type,
-                                 app_sd_volume_t *volume,
-                                 bool *saw_exfat)
-{
-    const uint64_t card_sectors = card->csd.capacity;
-    if (start_lba >= card_sectors || sector_count == 0 ||
-        sector_count > UINT32_MAX || start_lba > UINT32_MAX ||
-        start_lba + sector_count > card_sectors) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint8_t sector[APP_SD_SECTOR_SIZE] = {0};
-    esp_err_t err = read_sd_sector(card, (uint32_t)start_lba, sector);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    app_sd_fs_t fs_type = detect_fat_vbr(sector);
-    if (fs_type == APP_SD_FS_EXFAT) {
-        if (saw_exfat) {
-            *saw_exfat = true;
-        }
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    if (fs_type == APP_SD_FS_UNKNOWN) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    *volume = (app_sd_volume_t) {
-        .layout = layout,
-        .fs_type = fs_type,
-        .start_lba = (uint32_t)start_lba,
-        .sector_count = (uint32_t)sector_count,
-        .partition_index = partition_index,
-        .partition_type = partition_type,
-    };
-    return ESP_OK;
-}
-
-static bool is_gpt_protective_mbr(const uint8_t *sector)
-{
-    if (!has_boot_sector_signature(sector)) {
-        return false;
-    }
-
-    for (uint8_t i = 0; i < 4; i++) {
-        const uint8_t *entry = sector + APP_MBR_PART_TABLE_OFFSET +
-                               (i * APP_MBR_PART_ENTRY_SIZE);
-        if (entry[APP_MBR_PART_TYPE_OFFSET] == 0xEE) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static esp_err_t probe_gpt_volume(sdmmc_card_t *card,
-                                  app_sd_volume_t *volume,
-                                  bool *saw_exfat)
-{
-    uint8_t gpt[APP_SD_SECTOR_SIZE] = {0};
-    esp_err_t err = read_sd_sector(card, APP_GPT_HEADER_LBA, gpt);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    if (memcmp(gpt, "EFI PART", 8) != 0) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    const uint32_t header_size = read_le32(gpt + 12);
-    const uint64_t entries_lba = read_le64(gpt + 72);
-    const uint32_t entry_count = read_le32(gpt + 80);
-    const uint32_t entry_size = read_le32(gpt + 84);
-
-    if (header_size < 92 || header_size > APP_SD_SECTOR_SIZE ||
-        entries_lba == 0 || entries_lba > UINT32_MAX ||
-        entry_count == 0 || entry_size < APP_GPT_ENTRY_SIZE ||
-        entry_size > APP_SD_SECTOR_SIZE) {
-        set_last_sd_hint("invalid GPT header");
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint8_t entry_sector[APP_SD_SECTOR_SIZE] = {0};
-    uint64_t loaded_sector = UINT64_MAX;
-    const uint32_t scan_count = (entry_count < APP_GPT_MAX_SCAN_ENTRIES) ?
-                                entry_count : APP_GPT_MAX_SCAN_ENTRIES;
-
-    for (uint32_t i = 0; i < scan_count; i++) {
-        const uint64_t entry_byte_offset = (uint64_t)i * entry_size;
-        const uint64_t sector_lba = entries_lba + entry_byte_offset / APP_SD_SECTOR_SIZE;
-        const uint32_t sector_offset = entry_byte_offset % APP_SD_SECTOR_SIZE;
-
-        if (sector_lba > UINT32_MAX ||
-            sector_offset + entry_size > APP_SD_SECTOR_SIZE) {
-            continue;
-        }
-
-        if (loaded_sector != sector_lba) {
-            err = read_sd_sector(card, (uint32_t)sector_lba, entry_sector);
-            if (err != ESP_OK) {
-                return err;
-            }
-            loaded_sector = sector_lba;
-        }
-
-        const uint8_t *entry = entry_sector + sector_offset;
-        if (partition_type_is_empty(entry)) {
-            continue;
-        }
-
-        const uint64_t first_lba = read_le64(entry + 32);
-        const uint64_t last_lba = read_le64(entry + 40);
-        if (first_lba == 0 || last_lba < first_lba) {
-            continue;
-        }
-
-        err = probe_volume_at(card, first_lba, last_lba - first_lba + 1,
-                              APP_SD_LAYOUT_GPT, (uint8_t)(i + 1), 0,
-                              volume, saw_exfat);
-        if (err == ESP_OK) {
-            return ESP_OK;
-        }
-        if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_NOT_SUPPORTED) {
-            return err;
-        }
-    }
-
-    return ESP_ERR_NOT_FOUND;
-}
-
-static esp_err_t probe_mbr_volume(sdmmc_card_t *card,
-                                  const uint8_t *mbr,
-                                  app_sd_volume_t *volume,
-                                  bool *saw_exfat)
-{
-    if (!has_boot_sector_signature(mbr)) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    for (uint8_t i = 0; i < 4; i++) {
-        const uint8_t *entry = mbr + APP_MBR_PART_TABLE_OFFSET +
-                               (i * APP_MBR_PART_ENTRY_SIZE);
-        const uint8_t partition_type = entry[APP_MBR_PART_TYPE_OFFSET];
-        const uint32_t first_lba = read_le32(entry + APP_MBR_PART_LBA_OFFSET);
-        const uint32_t sector_count = read_le32(entry + APP_MBR_PART_SIZE_OFFSET);
-
-        if (partition_type == 0 || first_lba == 0 || sector_count == 0) {
-            continue;
-        }
-
-        esp_err_t err = probe_volume_at(card, first_lba, sector_count,
-                                        APP_SD_LAYOUT_MBR, i + 1, partition_type,
-                                        volume, saw_exfat);
-        if (err == ESP_OK) {
-            return ESP_OK;
-        }
-        if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_NOT_SUPPORTED) {
-            return err;
-        }
-    }
-
-    return ESP_ERR_NOT_FOUND;
-}
-
-static esp_err_t probe_sd_volume(sdmmc_card_t *card, app_sd_volume_t *volume)
-{
-    memset(volume, 0, sizeof(*volume));
-
-    uint8_t sector0[APP_SD_SECTOR_SIZE] = {0};
-    esp_err_t err = read_sd_sector(card, 0, sector0);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    bool saw_exfat = false;
-    const app_sd_fs_t sfd_fs = detect_fat_vbr(sector0);
-    if (sfd_fs == APP_SD_FS_FAT || sfd_fs == APP_SD_FS_FAT32) {
-        if (card->csd.capacity > UINT32_MAX) {
-            set_last_sd_hint("raw FAT/FAT32 volume is larger than 32-bit LBA range");
-            return ESP_ERR_NOT_SUPPORTED;
-        }
-
-        *volume = (app_sd_volume_t) {
-            .layout = APP_SD_LAYOUT_SUPER_FLOPPY,
-            .fs_type = sfd_fs,
-            .start_lba = 0,
-            .sector_count = (uint32_t)card->csd.capacity,
-        };
-        return ESP_OK;
-    }
-    if (sfd_fs == APP_SD_FS_EXFAT) {
-        set_last_sd_hint("SD card is exFAT; this firmware supports FAT/FAT32 only");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    const bool has_gpt = is_gpt_protective_mbr(sector0);
-    if (has_gpt) {
-        err = probe_gpt_volume(card, volume, &saw_exfat);
-        if (err == ESP_OK) {
-            return ESP_OK;
-        }
-        if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_NOT_SUPPORTED) {
-            return err;
-        }
-    }
-
-    err = probe_mbr_volume(card, sector0, volume, &saw_exfat);
-    if (err == ESP_OK) {
-        return ESP_OK;
-    }
-    if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_NOT_SUPPORTED) {
-        return err;
-    }
-
-    if (saw_exfat) {
-        set_last_sd_hint("found exFAT partition; this firmware supports FAT/FAT32 only");
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    if (has_gpt) {
-        set_last_sd_hint("GPT was detected, but no FAT/FAT32 partition VBR was found");
-    } else {
-        set_last_sd_hint("no FAT/FAT32 volume found in sector 0 or MBR partitions");
-    }
-    return ESP_ERR_NOT_FOUND;
-}
-
-static bool app_sd_disk_is_current(BYTE pdrv)
-{
-    return s_sd_disk.card != NULL && s_sd_disk.pdrv == pdrv;
-}
-
-static DSTATUS app_sd_disk_initialize(BYTE pdrv)
-{
-    return app_sd_disk_is_current(pdrv) ? 0 : STA_NOINIT;
-}
-
-static DSTATUS app_sd_disk_status(BYTE pdrv)
-{
-    if (!app_sd_disk_is_current(pdrv)) {
-        return STA_NOINIT;
-    }
-
-    if (!s_sd_disk.disk_status_check) {
-        return 0;
-    }
-
-    return (sdmmc_get_status(s_sd_disk.card) == ESP_OK) ? 0 : STA_NOINIT;
-}
-
-static DRESULT app_sd_disk_read(BYTE pdrv, BYTE *buffer, DWORD sector, UINT count)
-{
-    if (!app_sd_disk_is_current(pdrv)) {
-        return RES_NOTRDY;
-    }
-    if (count == 0) {
-        return RES_OK;
-    }
-    if ((uint64_t)sector + count > s_sd_disk.sector_count) {
-        return RES_PARERR;
-    }
-
-    esp_err_t err = sdmmc_read_sectors(s_sd_disk.card, buffer,
-                                       s_sd_disk.start_lba + sector, count);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SD read failed at partition sector %" PRIu32 ": %s",
-                 (uint32_t)sector, esp_err_to_name(err));
-        return RES_ERROR;
-    }
-    return RES_OK;
-}
-
-static DRESULT app_sd_disk_write(BYTE pdrv, const BYTE *buffer, DWORD sector, UINT count)
-{
-    if (!app_sd_disk_is_current(pdrv)) {
-        return RES_NOTRDY;
-    }
-    if (count == 0) {
-        return RES_OK;
-    }
-    if ((uint64_t)sector + count > s_sd_disk.sector_count) {
-        return RES_PARERR;
-    }
-
-    esp_err_t err = sdmmc_write_sectors(s_sd_disk.card, buffer,
-                                        s_sd_disk.start_lba + sector, count);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SD write failed at partition sector %" PRIu32 ": %s",
-                 (uint32_t)sector, esp_err_to_name(err));
-        return RES_ERROR;
-    }
-    return RES_OK;
-}
-
-static DRESULT app_sd_disk_ioctl(BYTE pdrv, BYTE cmd, void *buffer)
-{
-    if (!app_sd_disk_is_current(pdrv)) {
-        return RES_NOTRDY;
-    }
-
-    switch (cmd) {
-    case CTRL_SYNC:
-        return RES_OK;
-    case GET_SECTOR_COUNT:
-        *((DWORD *)buffer) = s_sd_disk.sector_count;
-        return RES_OK;
-    case GET_SECTOR_SIZE:
-        *((WORD *)buffer) = s_sd_disk.sector_size;
-        return RES_OK;
-    case GET_BLOCK_SIZE:
-        *((DWORD *)buffer) = 1;
-        return RES_OK;
-    default:
-        return RES_PARERR;
-    }
-}
-
-static void call_sd_host_deinit(const sdmmc_host_t *host)
-{
-    if (host == NULL) {
-        return;
-    }
-
-    if ((host->flags & SDMMC_HOST_FLAG_DEINIT_ARG) && host->deinit_p != NULL) {
-        host->deinit_p(host->slot);
-    } else if (host->deinit != NULL) {
-        host->deinit();
-    }
-}
-
-static esp_err_t init_sdmmc_card(uint8_t bus_width, sdmmc_card_t **out_card)
-{
-    sdmmc_host_t host = {0};
-    sdmmc_slot_config_t slot = {0};
-    sdmmc_card_t *card = calloc(1, sizeof(*card));
-    bool host_inited = false;
-
-    if (card == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    bsp_sdcard_get_sdmmc_host(SDMMC_HOST_SLOT_0, &host);
-    bsp_sdcard_sdmmc_get_slot(SDMMC_HOST_SLOT_0, &slot);
-    slot.width = bus_width;
-
-    esp_err_t err = host.init();
-    if (err != ESP_OK) {
-        set_last_sd_hint("SDMMC host init failed in %u-bit mode: %s",
-                         bus_width, esp_err_to_name(err));
-        goto fail;
-    }
-    host_inited = true;
-
-    err = sdmmc_host_init_slot(host.slot, &slot);
-    if (err != ESP_OK) {
-        set_last_sd_hint("SDMMC slot init failed in %u-bit mode: %s",
-                         bus_width, esp_err_to_name(err));
-        goto fail;
-    }
-
-    err = sdmmc_card_init(&host, card);
-    if (err != ESP_OK) {
-        set_last_sd_hint("SD card init failed in %u-bit mode: %s",
-                         bus_width, esp_err_to_name(err));
-        goto fail;
-    }
-
-    *out_card = card;
-    return ESP_OK;
-
-fail:
-    if (host_inited) {
-        call_sd_host_deinit(&host);
-    }
-    free(card);
-    return err;
-}
-
-static void cleanup_failed_sd_mount(sdmmc_card_t *card)
-{
-    if (s_sd_fs != NULL && s_sd_drive[0] != '\0') {
-        f_mount(NULL, s_sd_drive, 0);
-        esp_vfs_fat_unregister_path(BSP_SD_MOUNT_POINT);
-    }
-
-    if (s_sd_disk.pdrv != FF_DRV_NOT_USED) {
-        ff_diskio_unregister(s_sd_disk.pdrv);
-    }
-
-    memset(&s_sd_disk, 0, sizeof(s_sd_disk));
-    s_sd_disk.pdrv = FF_DRV_NOT_USED;
-    s_sd_fs = NULL;
-    s_sd_drive[0] = '\0';
-
-    if (card != NULL) {
-        call_sd_host_deinit(&card->host);
-        free(card);
-    }
-}
-
-static esp_err_t mount_initialized_sd_card(sdmmc_card_t *card,
-                                           const app_sd_volume_t *volume,
-                                           const esp_vfs_fat_mount_config_t *mount_config)
-{
-    static const ff_diskio_impl_t diskio = {
-        .init = app_sd_disk_initialize,
-        .status = app_sd_disk_status,
-        .read = app_sd_disk_read,
-        .write = app_sd_disk_write,
-        .ioctl = app_sd_disk_ioctl,
-    };
-
-    BYTE pdrv = FF_DRV_NOT_USED;
-    esp_err_t err = ff_diskio_get_drive(&pdrv);
-    if (err != ESP_OK || pdrv == FF_DRV_NOT_USED) {
-        set_last_sd_hint("no free FatFs physical drive");
-        return ESP_ERR_NO_MEM;
-    }
-    if (pdrv > 9) {
-        set_last_sd_hint("FatFs drive number %u is unsupported by this mount path",
-                         (unsigned)pdrv);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    s_sd_disk = (app_sd_disk_t) {
-        .card = card,
-        .pdrv = pdrv,
-        .start_lba = volume->start_lba,
-        .sector_count = volume->sector_count,
-        .sector_size = APP_SD_SECTOR_SIZE,
-        .disk_status_check = mount_config->disk_status_check_enable,
-    };
-    ff_diskio_register(pdrv, &diskio);
-
-    s_sd_drive[0] = (char)('0' + pdrv);
-    s_sd_drive[1] = ':';
-    s_sd_drive[2] = '\0';
-    const esp_vfs_fat_conf_t conf = {
-        .base_path = BSP_SD_MOUNT_POINT,
-        .fat_drive = s_sd_drive,
-        .max_files = mount_config->max_files,
-    };
-
-    err = esp_vfs_fat_register(&conf, &s_sd_fs);
-    if (err != ESP_OK) {
-        set_last_sd_hint("esp_vfs_fat_register failed: %s", esp_err_to_name(err));
-        cleanup_failed_sd_mount(NULL);
-        return err;
-    }
-
-    s_last_fresult = f_mount(s_sd_fs, s_sd_drive, 1);
-    if (s_last_fresult != FR_OK) {
-        set_last_sd_hint("FatFs mount failed with FRESULT=%d", (int)s_last_fresult);
-        cleanup_failed_sd_mount(NULL);
-        return ESP_FAIL;
-    }
-
-    s_sd_card = card;
-    s_sd_volume = *volume;
-    ESP_LOGI(TAG,
-             "SD card mounted at %s (%s %s, start_lba=%" PRIu32 ", sectors=%" PRIu32 ")",
-             BSP_SD_MOUNT_POINT,
-             sd_layout_name(volume->layout),
-             sd_fs_name(volume->fs_type),
-             volume->start_lba,
-             volume->sector_count);
-    return ESP_OK;
-}
-
 static esp_err_t mount_sdmmc_with_width(uint8_t bus_width)
 {
-    const esp_vfs_fat_mount_config_t mount_config = {
+    const esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,
         .max_files = 10,
         .allocation_unit_size = 16 * 1024,
@@ -937,20 +281,10 @@ static esp_err_t mount_sdmmc_with_width(uint8_t bus_width)
         .use_one_fat = false,
     };
 
-    sdmmc_card_t *card = NULL;
-    esp_err_t err = init_sdmmc_card(bus_width, &card);
+    esp_err_t err = bsp_sdcard_mount_with_width(bus_width, &mount_config);
     if (err != ESP_OK) {
-        return err;
-    }
-
-    app_sd_volume_t volume = {0};
-    err = probe_sd_volume(card, &volume);
-    if (err == ESP_OK) {
-        err = mount_initialized_sd_card(card, &volume, &mount_config);
-    }
-
-    if (err != ESP_OK) {
-        cleanup_failed_sd_mount(card);
+        set_last_sd_hint("SDMMC %u-bit mount failed through BSP helper: %s",
+                         bus_width, esp_err_to_name(err));
     }
     return err;
 }
@@ -958,31 +292,42 @@ static esp_err_t mount_sdmmc_with_width(uint8_t bus_width)
 static esp_err_t mount_sd_card(void)
 {
     s_last_sd_hint[0] = '\0';
-    s_last_fresult = FR_OK;
+    s_sd_bus_width = 0;
 
     esp_err_t err = mount_sdmmc_with_width(4);
     if (err == ESP_OK) {
+        s_sd_bus_width = 4;
         ESP_LOGI(TAG, "SD card mounted at %s (SDMMC 4-bit)", BSP_SD_MOUNT_POINT);
         return ESP_OK;
     }
+    const esp_err_t four_bit_err = err;
+    char four_bit_hint[APP_SD_HINT_MAX];
+    snprintf(four_bit_hint, sizeof(four_bit_hint), "%s",
+             s_last_sd_hint[0] ? s_last_sd_hint : "no detail");
 
     ESP_LOGW(TAG, "SDMMC 4-bit mount failed: %s (%s), retrying 1-bit",
              esp_err_to_name(err),
-             s_last_sd_hint[0] ? s_last_sd_hint : "no detail");
+             four_bit_hint);
 
     err = mount_sdmmc_with_width(1);
     if (err == ESP_OK) {
+        s_sd_bus_width = 1;
         ESP_LOGI(TAG, "SD card mounted at %s (SDMMC 1-bit fallback)", BSP_SD_MOUNT_POINT);
         return ESP_OK;
     }
+    char one_bit_hint[APP_SD_HINT_MAX];
+    snprintf(one_bit_hint, sizeof(one_bit_hint), "%s",
+             s_last_sd_hint[0] ? s_last_sd_hint : "no detail");
 
     s_last_sd_err = err;
     s_media_state = APP_MEDIA_SD_MOUNT_FAILED;
+    set_last_sd_hint("4-bit: %s (%s); 1-bit: %s (%s). Use a FAT/FAT32 card with /%s",
+                     esp_err_to_name(four_bit_err), four_bit_hint,
+                     esp_err_to_name(err), one_bit_hint,
+                     APP_SD_GIF_SUBDIR);
     ESP_LOGE(TAG,
-             "Failed to mount SD card: %s. %s. Expected directory: /%s",
-             esp_err_to_name(err),
-             s_last_sd_hint[0] ? s_last_sd_hint : "Use a FAT/FAT32-formatted card",
-             APP_SD_GIF_SUBDIR);
+             "Failed to mount SD card. %s",
+             s_last_sd_hint);
     return err;
 }
 
@@ -1029,9 +374,6 @@ static void print_media_status(void)
     switch (s_media_state) {
     case APP_MEDIA_SD_MOUNT_FAILED:
         dbg_console_printf("last SD error: %s\n", esp_err_to_name(s_last_sd_err));
-        if (s_last_fresult != FR_OK) {
-            dbg_console_printf("last FatFs result: %d\n", (int)s_last_fresult);
-        }
         dbg_console_printf("%s\n",
                            s_last_sd_hint[0] ? s_last_sd_hint :
                            "use a FAT/FAT32-formatted card; exFAT is not enabled");
@@ -1079,16 +421,7 @@ static void set_status_text(const char *fmt, ...)
     bsp_display_unlock();
 }
 
-static void *alloc_gif_data(size_t size)
-{
-    void *data = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (data == NULL) {
-        data = heap_caps_malloc(size, MALLOC_CAP_8BIT);
-    }
-    return data;
-}
-
-static uint16_t *alloc_gif_frame_data(size_t size)
+static void *alloc_gif_buffer(size_t size)
 {
     void *data = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (data == NULL) {
@@ -1135,7 +468,7 @@ static esp_err_t load_gif_into_memory(const app_gif_t *gif,
         return ESP_FAIL;
     }
 
-    uint8_t *data = alloc_gif_data(size);
+    uint8_t *data = alloc_gif_buffer(size);
     if (data == NULL) {
         fclose(fp);
         ESP_LOGE(TAG, "No memory for GIF '%s' (%u bytes)", gif->name, (unsigned)size);
@@ -1284,7 +617,13 @@ static void apply_previous_frame_disposal(app_gif_player_t *player)
     }
 
     const app_gif_frame_state_t *frame = &player->frame_state;
-    if (frame->disposal_method == 2 || frame->disposal_method == 3) {
+    if (frame->disposal_method == 2) {
+        fill_frame_rect(player, frame->x, frame->y, frame->w, frame->h, frame->bg_color);
+    } else if (frame->disposal_method == 3) {
+        /*
+         * Restore-to-previous needs an additional full-frame backup buffer. Keep memory
+         * usage bounded and degrade to background restore, matching the previous behavior.
+         */
         fill_frame_rect(player, frame->x, frame->y, frame->w, frame->h, frame->bg_color);
     }
 }
@@ -1384,6 +723,12 @@ static esp_err_t start_gif_player_locked(const app_gif_t *gif,
     player->source_data = source_data;
     player->source_size = source_size;
 
+    if (source_size > INT_MAX) {
+        ESP_LOGE(TAG, "GIF source is too large for %s: %u bytes",
+                 gif->name, (unsigned)source_size);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     GIF_begin(&player->gif, GIF_PALETTE_RGB565_LE);
     if (!GIF_openRAM(&player->gif, source_data, (int)source_size, gif_draw_cb)) {
         ESP_LOGE(TAG, "GIF_openRAM failed for %s, last_error=%d",
@@ -1393,12 +738,6 @@ static esp_err_t start_gif_player_locked(const app_gif_t *gif,
     player->open = true;
     player->width = GIF_getCanvasWidth(&player->gif);
     player->height = GIF_getCanvasHeight(&player->gif);
-
-    if (source_size > INT_MAX) {
-        ESP_LOGE(TAG, "GIF source is too large for %s: %u bytes",
-                 gif->name, (unsigned)source_size);
-        return ESP_ERR_INVALID_SIZE;
-    }
 
     if (player->width <= 0 || player->height <= 0 ||
         (size_t)player->width > SIZE_MAX / (size_t)player->height ||
@@ -1415,7 +754,7 @@ static esp_err_t start_gif_player_locked(const app_gif_t *gif,
                  gif->name, (unsigned)player->frame_data_size);
         return ESP_ERR_INVALID_SIZE;
     }
-    player->frame_data = alloc_gif_frame_data(player->frame_data_size);
+    player->frame_data = alloc_gif_buffer(player->frame_data_size);
     if (player->frame_data == NULL) {
         ESP_LOGE(TAG, "No memory for GIF frame buffer %s (%u bytes)",
                  gif->name, (unsigned)player->frame_data_size);
@@ -1441,10 +780,18 @@ static esp_err_t start_gif_player_locked(const app_gif_t *gif,
 
     lv_obj_t *parent = (s_gif_layer != NULL) ? s_gif_layer : lv_screen_active();
     player->image = lv_image_create(parent);
+    if (player->image == NULL) {
+        ESP_LOGE(TAG, "Failed to create LVGL image object for %s", gif->name);
+        return ESP_ERR_NO_MEM;
+    }
     lv_image_set_src(player->image, &player->frame_dsc);
     lv_obj_center(player->image);
 
     player->timer = lv_timer_create(gif_timer_cb, APP_GIF_MIN_FRAME_DELAY_MS, player);
+    if (player->timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create GIF timer for %s", gif->name);
+        return ESP_ERR_NO_MEM;
+    }
     lv_timer_pause(player->timer);
 
     if (!decode_next_frame_locked(player)) {
@@ -1703,6 +1050,11 @@ static int cmd_status(int argc, char **argv)
 
     print_media_status();
     dbg_console_printf("gifs    : %d\n", s_total);
+    if (s_sd_bus_width > 0) {
+        dbg_console_printf("sd bus  : %u-bit\n", (unsigned)s_sd_bus_width);
+    } else {
+        dbg_console_printf("sd bus  : not mounted\n");
+    }
     if (s_total > 0 && s_cur_index >= 0 && s_cur_index < s_total) {
         dbg_console_printf("current : %d/%d %s\n",
                            s_cur_index + 1, s_total, s_gifs[s_cur_index].name);

@@ -656,6 +656,29 @@ esp_err_t bsp_sdcard_mount(void)
     return bsp_sdcard_sdmmc_mount(&cfg);
 }
 
+esp_err_t bsp_sdcard_mount_with_width(uint8_t bus_width,
+                                      const esp_vfs_fat_sdmmc_mount_config_t *mount_config)
+{
+    if (bus_width != 1 && bus_width != 4) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    sdmmc_host_t host = {0};
+    sdmmc_slot_config_t slot = {0};
+    bsp_sdcard_get_sdmmc_host(SDMMC_HOST_SLOT_0, &host);
+    bsp_sdcard_sdmmc_get_slot(SDMMC_HOST_SLOT_0, &slot);
+    slot.width = bus_width;
+
+    bsp_sdcard_cfg_t cfg = {
+        .mount = mount_config,
+        .host = &host,
+        .slot = {
+            .sdmmc = &slot,
+        },
+    };
+    return bsp_sdcard_sdmmc_mount(&cfg);
+}
+
 esp_err_t bsp_sdcard_unmount(void)
 {
     esp_err_t ret = ESP_OK;

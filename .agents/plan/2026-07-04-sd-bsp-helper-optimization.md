@@ -1,0 +1,31 @@
+# ESP32-S3 SD BSP Helper Optimization Plan
+
+## Summary
+
+- Target stack: ESP-IDF v6.0.1, ESP32-S3 SDMMC, FatFs/VFS, LVGL 9.x AnimatedGIF, and the local Waveshare BSP fork ported to IDF 6.
+- Chosen strategy: use the BSP/ESP-IDF SD mount helper path and remove the application-owned MBR/GPT/SFD probing and FatFs diskio layer.
+- Behavior change: SD cards must be mountable by `esp_vfs_fat_sdmmc_mount()` as FAT/FAT32. Custom partition-offset mounting and exFAT diagnostics are intentionally removed.
+
+## References
+
+- ESP-IDF v6.0.1 FatFs/VFS SD mount API: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32s3/api-reference/storage/fatfs.html
+- ESP-IDF v6.0.1 SDMMC Host bus width: https://docs.espressif.com/projects/esp-idf/en/v6.0.1/esp32s3/api-reference/peripherals/sdmmc_host.html
+- Waveshare ESP32-S3-Touch-LCD-1.85B upstream: https://github.com/waveshareteam/ESP32-S3-Touch-LCD-1.85B
+
+## Implementation Notes
+
+- Add `bsp_sdcard_mount_with_width()` to the BSP and keep `bsp_sdcard_mount()` compatible.
+- In `main/main.c`, mount SD through BSP helper with 4-bit first, then 1-bit fallback.
+- Remove application-level SD sector parsing, FatFs diskio registration, and unused SD global state.
+- Keep `CONFIG_LV_USE_GIF=y` because the manual player uses LVGL's `AnimatedGIF.h`; remove stale LVGL stdio FS settings.
+- Remove the unused SPIFFS `assets` partition and expand the factory app partition.
+- Harden GIF startup cleanup and keep disposal method 3 as an explicit low-memory degradation.
+
+## Verification
+
+- `git diff --check`: passed.
+- Static cleanup check passed: `main/main.c` no longer contains `diskio_impl.h`, `sdmmc_cmd.h`, custom FatFs diskio registration, or the removed app-level SD probing symbols.
+- Build passed with `IDF_PATH=/Users/lvjiaqing/.espressif/v6.0.1/esp-idf ninja -C build`.
+  - Output image: `build/test.bin`.
+  - App size: `0xb7090`; app partition size: `0xff0000`.
+- Runtime checks still require hardware: SD mounted with FAT/FAT32, `/sdcard/assets/gif` scanning, missing SD, missing directory, empty directory, corrupt GIF, button switching, and console commands.

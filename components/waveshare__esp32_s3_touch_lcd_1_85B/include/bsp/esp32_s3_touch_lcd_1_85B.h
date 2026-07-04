@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
@@ -359,6 +361,23 @@ typedef struct {
  *      - other error codes from SDMMC or SPI drivers, SDMMC protocol, or FATFS drivers
  */
 esp_err_t bsp_sdcard_mount(void);
+
+/**
+ * @brief Mount microSD card to virtual file system with a fixed SDMMC bus width
+ *
+ * @param bus_width SDMMC bus width, supported values are 1 and 4
+ * @param mount Mount configuration, or NULL to use the BSP default
+ *
+ * @return
+ *      - ESP_OK on success
+ *      - ESP_ERR_INVALID_ARG if bus_width is not supported
+ *      - ESP_ERR_INVALID_STATE if esp_vfs_fat_sdmmc_mount was already called
+ *      - ESP_ERR_NO_MEM if memory cannot be allocated
+ *      - ESP_FAIL if partition cannot be mounted
+ *      - other error codes from SDMMC drivers, SDMMC protocol, or FATFS drivers
+ */
+esp_err_t bsp_sdcard_mount_with_width(uint8_t bus_width,
+                                      const esp_vfs_fat_sdmmc_mount_config_t *mount);
 
 /**
  * @brief Unmount microSD card from virtual file system

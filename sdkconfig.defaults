@@ -18,9 +18,5 @@ CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_LOG=y
 CONFIG_LV_LOG_LEVEL_WARN=y
 CONFIG_LV_LOG_PRINTF=y
-CONFIG_LV_USE_FS_STDIO=y
-CONFIG_LV_FS_STDIO_LETTER=83
-CONFIG_LV_FS_STDIO_PATH="/sdcard/assets/gif/"
-CONFIG_LV_FS_STDIO_CACHE_SIZE=8192
 # TE full-frame mode deadlocks on flush error and starves PSRAM bandwidth; use partial refresh
 # CONFIG_BSP_LCD_TE_RESISTANT is not set
