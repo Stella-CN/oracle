@@ -47,3 +47,12 @@
 - Build after fix passed with `IDF_PATH=/Users/lvjiaqing/.espressif/v6.0.1/esp-idf ninja -C build`.
   - Output image: `build/test.bin`.
   - App size: `0xb8300`; app partition size: `0xff0000`.
+
+## Field Fix: Offset Fallback Stack Overflow
+
+- Observed log: `***ERROR*** A stack overflow in task main has been detected` immediately after entering the BSP offset fallback.
+- Root cause: the fallback probe path kept multiple 512-byte SD sector buffers on the main task stack (`sector0`, GPT header/table sector, and FAT VBR sector). Nested SDMMC/FatFs calls pushed the task over its stack limit.
+- Fix: allocate SD sector probe buffers from DMA-capable internal heap with `heap_caps_calloc()` and release them on every exit path.
+- Build after fix passed with `IDF_PATH=/Users/lvjiaqing/.espressif/v6.0.1/esp-idf ninja -C build`.
+  - Output image: `build/test.bin`.
+  - App size: `0xb8330`; app partition size: `0xff0000`.

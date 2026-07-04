@@ -11,6 +11,7 @@
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_lcd_panel_io.h"
@@ -778,6 +779,16 @@ static bool bsp_partition_entry_is_empty(const uint8_t *entry)
     return true;
 }
 
+static uint8_t *bsp_alloc_sd_sector_buffer(void)
+{
+    uint8_t *buffer = heap_caps_calloc(1, BSP_SD_SECTOR_SIZE,
+                                       MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (buffer == NULL) {
+        ESP_LOGE(TAG, "No memory for SD sector probe buffer");
+    }
+    return buffer;
+}
+
 static esp_err_t bsp_read_sd_sector(sdmmc_card_t *card, uint32_t sector, uint8_t *buffer)
 {
     if (card == NULL || buffer == NULL) {
@@ -812,10 +823,14 @@ static esp_err_t bsp_probe_volume_at(sdmmc_card_t *card,
         return ESP_ERR_NOT_FOUND;
     }
 
-    uint8_t sector[BSP_SD_SECTOR_SIZE] = {0};
+    uint8_t *sector = bsp_alloc_sd_sector_buffer();
+    if (sector == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     esp_err_t err = bsp_read_sd_sector(card, (uint32_t)start_lba, sector);
     if (err != ESP_OK) {
-        return err;
+        goto cleanup;
     }
 
     bsp_sd_fs_t fs_type = bsp_detect_fat_vbr(sector);
@@ -823,10 +838,12 @@ static esp_err_t bsp_probe_volume_at(sdmmc_card_t *card,
         if (saw_exfat) {
             *saw_exfat = true;
         }
-        return ESP_ERR_NOT_SUPPORTED;
+        err = ESP_ERR_NOT_SUPPORTED;
+        goto cleanup;
     }
     if (fs_type == BSP_SD_FS_UNKNOWN) {
-        return ESP_ERR_NOT_FOUND;
+        err = ESP_ERR_NOT_FOUND;
+        goto cleanup;
     }
 
     *volume = (bsp_sd_volume_t) {
@@ -837,7 +854,11 @@ static esp_err_t bsp_probe_volume_at(sdmmc_card_t *card,
         .partition_index = partition_index,
         .partition_type = partition_type,
     };
-    return ESP_OK;
+    err = ESP_OK;
+
+cleanup:
+    free(sector);
+    return err;
 }
 
 static bool bsp_is_gpt_protective_mbr(const uint8_t *sector)
@@ -860,30 +881,35 @@ static esp_err_t bsp_probe_gpt_volume(sdmmc_card_t *card,
                                       bsp_sd_volume_t *volume,
                                       bool *saw_exfat)
 {
-    uint8_t gpt[BSP_SD_SECTOR_SIZE] = {0};
-    esp_err_t err = bsp_read_sd_sector(card, BSP_GPT_HEADER_LBA, gpt);
+    uint8_t *sector = bsp_alloc_sd_sector_buffer();
+    if (sector == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = bsp_read_sd_sector(card, BSP_GPT_HEADER_LBA, sector);
     if (err != ESP_OK) {
-        return err;
+        goto cleanup;
     }
 
-    if (memcmp(gpt, "EFI PART", 8) != 0) {
-        return ESP_ERR_NOT_FOUND;
+    if (memcmp(sector, "EFI PART", 8) != 0) {
+        err = ESP_ERR_NOT_FOUND;
+        goto cleanup;
     }
 
-    const uint32_t header_size = bsp_read_le32(gpt + 12);
-    const uint64_t entries_lba = bsp_read_le64(gpt + 72);
-    const uint32_t entry_count = bsp_read_le32(gpt + 80);
-    const uint32_t entry_size = bsp_read_le32(gpt + 84);
+    const uint32_t header_size = bsp_read_le32(sector + 12);
+    const uint64_t entries_lba = bsp_read_le64(sector + 72);
+    const uint32_t entry_count = bsp_read_le32(sector + 80);
+    const uint32_t entry_size = bsp_read_le32(sector + 84);
 
     if (header_size < 92 || header_size > BSP_SD_SECTOR_SIZE ||
         entries_lba == 0 || entries_lba > UINT32_MAX ||
         entry_count == 0 || entry_size < BSP_GPT_ENTRY_SIZE ||
         entry_size > BSP_SD_SECTOR_SIZE) {
         ESP_LOGW(TAG, "Invalid GPT header");
-        return ESP_ERR_NOT_FOUND;
+        err = ESP_ERR_NOT_FOUND;
+        goto cleanup;
     }
 
-    uint8_t entry_sector[BSP_SD_SECTOR_SIZE] = {0};
     uint64_t loaded_sector = UINT64_MAX;
     const uint32_t scan_count = (entry_count < BSP_GPT_MAX_SCAN_ENTRIES) ?
                                 entry_count : BSP_GPT_MAX_SCAN_ENTRIES;
@@ -899,14 +925,14 @@ static esp_err_t bsp_probe_gpt_volume(sdmmc_card_t *card,
         }
 
         if (loaded_sector != sector_lba) {
-            err = bsp_read_sd_sector(card, (uint32_t)sector_lba, entry_sector);
+            err = bsp_read_sd_sector(card, (uint32_t)sector_lba, sector);
             if (err != ESP_OK) {
-                return err;
+                goto cleanup;
             }
             loaded_sector = sector_lba;
         }
 
-        const uint8_t *entry = entry_sector + sector_offset;
+        const uint8_t *entry = sector + sector_offset;
         if (bsp_partition_entry_is_empty(entry)) {
             continue;
         }
@@ -921,14 +947,18 @@ static esp_err_t bsp_probe_gpt_volume(sdmmc_card_t *card,
                                   BSP_SD_LAYOUT_GPT, (uint8_t)(i + 1), 0,
                                   volume, saw_exfat);
         if (err == ESP_OK) {
-            return ESP_OK;
+            goto cleanup;
         }
         if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_NOT_SUPPORTED) {
-            return err;
+            goto cleanup;
         }
     }
 
-    return ESP_ERR_NOT_FOUND;
+    err = ESP_ERR_NOT_FOUND;
+
+cleanup:
+    free(sector);
+    return err;
 }
 
 static esp_err_t bsp_probe_mbr_volume(sdmmc_card_t *card,
@@ -969,10 +999,14 @@ static esp_err_t bsp_probe_sd_volume(sdmmc_card_t *card, bsp_sd_volume_t *volume
 {
     memset(volume, 0, sizeof(*volume));
 
-    uint8_t sector0[BSP_SD_SECTOR_SIZE] = {0};
+    uint8_t *sector0 = bsp_alloc_sd_sector_buffer();
+    if (sector0 == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
     esp_err_t err = bsp_read_sd_sector(card, 0, sector0);
     if (err != ESP_OK) {
-        return err;
+        goto cleanup;
     }
 
     bool saw_exfat = false;
@@ -980,7 +1014,8 @@ static esp_err_t bsp_probe_sd_volume(sdmmc_card_t *card, bsp_sd_volume_t *volume
     if (sfd_fs == BSP_SD_FS_FAT || sfd_fs == BSP_SD_FS_FAT32) {
         if (card->csd.capacity > UINT32_MAX) {
             ESP_LOGE(TAG, "Raw FAT/FAT32 volume is larger than 32-bit LBA range");
-            return ESP_ERR_NOT_SUPPORTED;
+            err = ESP_ERR_NOT_SUPPORTED;
+            goto cleanup;
         }
 
         *volume = (bsp_sd_volume_t) {
@@ -989,41 +1024,48 @@ static esp_err_t bsp_probe_sd_volume(sdmmc_card_t *card, bsp_sd_volume_t *volume
             .start_lba = 0,
             .sector_count = (uint32_t)card->csd.capacity,
         };
-        return ESP_OK;
+        err = ESP_OK;
+        goto cleanup;
     }
     if (sfd_fs == BSP_SD_FS_EXFAT) {
         ESP_LOGE(TAG, "SD card is exFAT; this firmware supports FAT/FAT32 only");
-        return ESP_ERR_NOT_SUPPORTED;
+        err = ESP_ERR_NOT_SUPPORTED;
+        goto cleanup;
     }
 
     const bool has_gpt = bsp_is_gpt_protective_mbr(sector0);
     if (has_gpt) {
         err = bsp_probe_gpt_volume(card, volume, &saw_exfat);
         if (err == ESP_OK) {
-            return ESP_OK;
+            goto cleanup;
         }
         if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_NOT_SUPPORTED) {
-            return err;
+            goto cleanup;
         }
     }
 
     err = bsp_probe_mbr_volume(card, sector0, volume, &saw_exfat);
     if (err == ESP_OK) {
-        return ESP_OK;
+        goto cleanup;
     }
     if (err != ESP_ERR_NOT_FOUND && err != ESP_ERR_NOT_SUPPORTED) {
-        return err;
+        goto cleanup;
     }
 
     if (saw_exfat) {
         ESP_LOGE(TAG, "Found exFAT partition; this firmware supports FAT/FAT32 only");
-        return ESP_ERR_NOT_SUPPORTED;
+        err = ESP_ERR_NOT_SUPPORTED;
+        goto cleanup;
     }
 
     ESP_LOGE(TAG, "%s",
              has_gpt ? "GPT detected, but no FAT/FAT32 partition VBR was found" :
                        "No FAT/FAT32 volume found in sector 0 or MBR partitions");
-    return ESP_ERR_NOT_FOUND;
+    err = ESP_ERR_NOT_FOUND;
+
+cleanup:
+    free(sector0);
+    return err;
 }
 
 static bool bsp_sd_disk_is_current(BYTE pdrv)
