@@ -40,7 +40,7 @@ static const char *TAG = "gif_player";
 #define APP_SD_GIF_DIR             BSP_SD_MOUNT_POINT "/" APP_SD_GIF_SUBDIR
 #define APP_LVGL_LOCK_TIMEOUT_MS   -1
 #define APP_SCAN_PATH_MAX          320
-#define APP_SD_HINT_MAX            160U
+#define APP_SD_HINT_MAX            256U
 #define APP_GIF_LOAD_CHUNK_SIZE    (16U * 1024U)
 #define APP_GIF_MIN_FRAME_DELAY_MS 20U
 
@@ -321,7 +321,7 @@ static esp_err_t mount_sd_card(void)
 
     s_last_sd_err = err;
     s_media_state = APP_MEDIA_SD_MOUNT_FAILED;
-    set_last_sd_hint("4-bit: %s (%s); 1-bit: %s (%s). Use a FAT/FAT32 card with /%s",
+    set_last_sd_hint("4-bit: %s (%s); 1-bit: %s (%s). Supported: FAT/FAT32 on SFD/MBR/GPT; exFAT is not enabled. Expected /%s",
                      esp_err_to_name(four_bit_err), four_bit_hint,
                      esp_err_to_name(err), one_bit_hint,
                      APP_SD_GIF_SUBDIR);
@@ -1156,6 +1156,15 @@ void app_main(void)
         ESP_LOGW(TAG, "Button init failed: %s", esp_err_to_name(err));
     }
 
+    set_status_text("mounting SD...");
+    err = mount_sd_and_scan_gifs();
+    if (err == ESP_OK) {
+        show_gif(0);
+    } else {
+        ESP_LOGW(TAG, "GIF source unavailable: %s", media_status_text());
+        set_status_text("%s", media_status_text());
+    }
+
     const dbg_console_config_t console_cfg = {
         .prompt = "dbg> ",
         .max_cmdline_length = 256,
@@ -1163,14 +1172,10 @@ void app_main(void)
         .register_user_cmds = register_app_cmds,
         .user_ctx = NULL,
     };
-    ESP_ERROR_CHECK(dbg_console_start(&console_cfg));
-
-    err = mount_sd_and_scan_gifs();
-    if (err == ESP_OK) {
-        show_gif(0);
-    } else {
-        ESP_LOGW(TAG, "GIF source unavailable: %s", media_status_text());
-        set_status_text("%s", media_status_text());
+    err = dbg_console_start(&console_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Debug console unavailable: %s; continue without REPL",
+                 esp_err_to_name(err));
     }
 
     app_evt_t evt;

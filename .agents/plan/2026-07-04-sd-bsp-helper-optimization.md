@@ -29,3 +29,21 @@
   - Output image: `build/test.bin`.
   - App size: `0xb7090`; app partition size: `0xff0000`.
 - Runtime checks still require hardware: SD mounted with FAT/FAT32, `/sdcard/assets/gif` scanning, missing SD, missing directory, empty directory, corrupt GIF, button switching, and console commands.
+
+## Field Fix: SD Mount Failed / USB-Free Boot Stuck
+
+- Observed log: `failed to mount card (13)` maps to FatFs `FR_NO_FILESYSTEM`.
+- Root cause analysis:
+  - `esp_vfs_fat_sdmmc_mount()` initialized and read the card, but FatFs did not find a directly mountable volume.
+  - ESP-IDF v6.0.1 FatFs has MBR/SFD auto-scan, but GPT scanning is compiled out because `FF_LBA64=0`; exFAT is also compiled out with `FF_FS_EXFAT=0`.
+  - The BSP LFN warning was stale: IDF 6 uses `CONFIG_FATFS_LFN_*`, not `CONFIG_FATFS_LONG_FILENAMES`.
+  - `dbg_console_start()` ran before SD status update and was wrapped by `ESP_ERROR_CHECK()`, so a console-device failure could leave the display at `starting...`.
+- Fix:
+  - Keep the official `esp_vfs_fat_sdmmc_mount()` path first.
+  - Add a BSP-contained offset fallback for FAT/FAT32 volumes in SFD/MBR/GPT when the official mount path fails.
+  - Keep application SD logic simple: `main.c` still calls only the BSP helper.
+  - Start SD mounting before the debug REPL and make debug console startup non-fatal.
+  - Fix the stale long-filename warning condition.
+- Build after fix passed with `IDF_PATH=/Users/lvjiaqing/.espressif/v6.0.1/esp-idf ninja -C build`.
+  - Output image: `build/test.bin`.
+  - App size: `0xb8300`; app partition size: `0xff0000`.
