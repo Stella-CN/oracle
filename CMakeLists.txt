@@ -6,4 +6,4 @@ set(IDF_TARGET "esp32s3")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 idf_build_set_property(DEPENDENCIES_LOCK dependencies.lock)
-project(test)
+project(Oracle)

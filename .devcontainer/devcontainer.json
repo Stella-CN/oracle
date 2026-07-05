@@ -1,5 +1,5 @@
 {
-	"name": "ESP-IDF QEMU",
+	"name": "Oracle ESP-IDF",
 	"build": {
 		"dockerfile": "Dockerfile"
 	},

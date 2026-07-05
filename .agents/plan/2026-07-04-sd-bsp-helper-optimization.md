@@ -26,7 +26,7 @@
 - `git diff --check`: passed.
 - Static cleanup check passed: `main/main.c` no longer contains `diskio_impl.h`, `sdmmc_cmd.h`, custom FatFs diskio registration, or the removed app-level SD probing symbols.
 - Build passed with `IDF_PATH=/Users/lvjiaqing/.espressif/v6.0.1/esp-idf ninja -C build`.
-  - Output image: `build/test.bin`.
+  - Output image: `build/Oracle.bin`.
   - App size: `0xb7090`; app partition size: `0xff0000`.
 - Runtime checks still require hardware: SD mounted with FAT/FAT32, `/sdcard/assets/gif` scanning, missing SD, missing directory, empty directory, corrupt GIF, button switching, and console commands.
 
@@ -45,7 +45,7 @@
   - Start SD mounting before the debug REPL and make debug console startup non-fatal.
   - Fix the stale long-filename warning condition.
 - Build after fix passed with `IDF_PATH=/Users/lvjiaqing/.espressif/v6.0.1/esp-idf ninja -C build`.
-  - Output image: `build/test.bin`.
+  - Output image: `build/Oracle.bin`.
   - App size: `0xb8300`; app partition size: `0xff0000`.
 
 ## Field Fix: Offset Fallback Stack Overflow
@@ -54,5 +54,5 @@
 - Root cause: the fallback probe path kept multiple 512-byte SD sector buffers on the main task stack (`sector0`, GPT header/table sector, and FAT VBR sector). Nested SDMMC/FatFs calls pushed the task over its stack limit.
 - Fix: allocate SD sector probe buffers from DMA-capable internal heap with `heap_caps_calloc()` and release them on every exit path.
 - Build after fix passed with `IDF_PATH=/Users/lvjiaqing/.espressif/v6.0.1/esp-idf ninja -C build`.
-  - Output image: `build/test.bin`.
+  - Output image: `build/Oracle.bin`.
   - App size: `0xb8330`; app partition size: `0xff0000`.
