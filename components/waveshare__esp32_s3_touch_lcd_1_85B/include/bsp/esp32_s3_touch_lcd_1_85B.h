@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #include "sdkconfig.h"
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
@@ -361,6 +363,23 @@ typedef struct {
 esp_err_t bsp_sdcard_mount(void);
 
 /**
+ * @brief Mount microSD card to virtual file system with a fixed SDMMC bus width
+ *
+ * @param bus_width SDMMC bus width, supported values are 1 and 4
+ * @param mount Mount configuration, or NULL to use the BSP default
+ *
+ * @return
+ *      - ESP_OK on success
+ *      - ESP_ERR_INVALID_ARG if bus_width is not supported
+ *      - ESP_ERR_INVALID_STATE if esp_vfs_fat_sdmmc_mount was already called
+ *      - ESP_ERR_NO_MEM if memory cannot be allocated
+ *      - ESP_FAIL if partition cannot be mounted
+ *      - other error codes from SDMMC drivers, SDMMC protocol, or FATFS drivers
+ */
+esp_err_t bsp_sdcard_mount_with_width(uint8_t bus_width,
+                                      const esp_vfs_fat_sdmmc_mount_config_t *mount);
+
+/**
  * @brief Unmount microSD card from virtual file system
  *
  * @return
@@ -466,7 +485,14 @@ esp_err_t get_file_list_by_ext(const char *dir_path, const char *extension, gene
  *
  * Display's backlight must be enabled explicitly by calling bsp_display_backlight_on()
  **************************************************************************************************/
-#define BSP_LCD_PIXEL_CLOCK_HZ     (80 * 1000 * 1000)
+/*
+ * QSPI bus clock for ST77916.
+ * NOTE: 80 MHz causes "spi_master: DMA TX underflow" (snow/garbage on screen) when the
+ * frame buffer lives in PSRAM and PSRAM bandwidth is shared with XIP (SPIRAM_FETCH_INSTRUCTIONS /
+ * SPIRAM_RODATA) plus application traffic (e.g. GIF decoding). 40 MHz still yields ~38 fps full
+ * frame updates on 360x360 RGB565 and leaves enough PSRAM bandwidth margin.
+ */
+#define BSP_LCD_PIXEL_CLOCK_HZ     (40 * 1000 * 1000)
 #define BSP_LCD_SPI_NUM            (SPI2_HOST)
 
 #if (BSP_CONFIG_NO_GRAPHIC_LIB == 0)

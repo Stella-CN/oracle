@@ -327,6 +327,6 @@ direct_dependencies:
 - waveshare/esp32_s3_touch_lcd_1_85B
 - waveshare/pcf85063a
 - waveshare/qmi8658
-manifest_hash: cc76c8c8caf831efc3a242efdb82b3f1d1f6343601ba9cd29ddeb9a9acaefe56
+manifest_hash: 9f593ad6f3ac39d8f47adc56b94596b1e97164a0a42d1f6880a3af02c346393b
 target: esp32s3
 version: 3.0.0
