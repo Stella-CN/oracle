@@ -371,7 +371,7 @@ esp_err_t bsp_sdcard_mount(void);
  * @return
  *      - ESP_OK on success
  *      - ESP_ERR_INVALID_ARG if bus_width is not supported
- *      - ESP_ERR_INVALID_STATE if esp_vfs_fat_sdmmc_mount was already called
+ *      - ESP_ERR_INVALID_STATE if the SD mount point is already registered
  *      - ESP_ERR_NO_MEM if memory cannot be allocated
  *      - ESP_FAIL if partition cannot be mounted
  *      - other error codes from SDMMC drivers, SDMMC protocol, or FATFS drivers

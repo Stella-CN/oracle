@@ -110,7 +110,7 @@ static bsp_sd_disk_t bsp_sd_disk = {
 };
 static FATFS *bsp_sd_fs = NULL;
 static char bsp_sd_drive[BSP_SD_FATFS_DRIVE_STR_MAX];
-static bool bsp_sd_uses_offset_diskio = false;
+static bool bsp_sd_uses_partition_diskio = false;
 
 /* Can be used for i2s_std_gpio_config_t and/or i2s_std_config_t initialization */
 #define BSP_ES7210_CODEC_ADDR ES7210_CODEC_DEFAULT_ADDR
@@ -1186,6 +1186,21 @@ static void bsp_call_sd_host_deinit(const sdmmc_host_t *host)
     }
 }
 
+static const esp_vfs_fat_sdmmc_mount_config_t *bsp_sdcard_default_mount_config(void)
+{
+    static const esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+#ifdef CONFIG_BSP_SD_FORMAT_ON_MOUNT_FAIL
+        .format_if_mount_failed = true,
+#else
+        .format_if_mount_failed = false,
+#endif
+        .max_files = 10,
+        .allocation_unit_size = 16 * 1024,
+    };
+
+    return &mount_config;
+}
+
 static esp_err_t bsp_init_sdmmc_card_with_width(uint8_t bus_width, sdmmc_card_t **out_card)
 {
     sdmmc_host_t host = {0};
@@ -1239,16 +1254,16 @@ fail:
     return err;
 }
 
-static void bsp_clear_offset_mount_state(void)
+static void bsp_clear_partition_mount_state(void)
 {
     memset(&bsp_sd_disk, 0, sizeof(bsp_sd_disk));
     bsp_sd_disk.pdrv = FF_DRV_NOT_USED;
     bsp_sd_fs = NULL;
     bsp_sd_drive[0] = '\0';
-    bsp_sd_uses_offset_diskio = false;
+    bsp_sd_uses_partition_diskio = false;
 }
 
-static void bsp_cleanup_offset_mount(sdmmc_card_t *card)
+static void bsp_cleanup_partition_mount(sdmmc_card_t *card)
 {
     if (bsp_sd_fs != NULL && bsp_sd_drive[0] != '\0') {
         f_mount(NULL, bsp_sd_drive, 0);
@@ -1259,7 +1274,7 @@ static void bsp_cleanup_offset_mount(sdmmc_card_t *card)
         ff_diskio_unregister(bsp_sd_disk.pdrv);
     }
 
-    bsp_clear_offset_mount_state();
+    bsp_clear_partition_mount_state();
 
     if (card != NULL) {
         bsp_call_sd_host_deinit(&card->host);
@@ -1270,9 +1285,9 @@ static void bsp_cleanup_offset_mount(sdmmc_card_t *card)
     }
 }
 
-static esp_err_t bsp_mount_initialized_sd_card_with_offset(sdmmc_card_t *card,
-                                                          const bsp_sd_volume_t *volume,
-                                                          const esp_vfs_fat_mount_config_t *mount_config)
+static esp_err_t bsp_mount_initialized_sd_card_partition(sdmmc_card_t *card,
+                                                        const bsp_sd_volume_t *volume,
+                                                        const esp_vfs_fat_mount_config_t *mount_config)
 {
     static const ff_diskio_impl_t diskio = {
         .init = bsp_sd_disk_initialize,
@@ -1316,21 +1331,21 @@ static esp_err_t bsp_mount_initialized_sd_card_with_offset(sdmmc_card_t *card,
     err = esp_vfs_fat_register(&conf, &bsp_sd_fs);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_vfs_fat_register failed: %s", esp_err_to_name(err));
-        bsp_cleanup_offset_mount(NULL);
+        bsp_cleanup_partition_mount(NULL);
         return err;
     }
 
     FRESULT fres = f_mount(bsp_sd_fs, bsp_sd_drive, 1);
     if (fres != FR_OK) {
-        ESP_LOGE(TAG, "FatFs offset mount failed with FRESULT=%d", (int)fres);
-        bsp_cleanup_offset_mount(NULL);
+        ESP_LOGE(TAG, "FatFs partition-aware mount failed with FRESULT=%d", (int)fres);
+        bsp_cleanup_partition_mount(NULL);
         return ESP_FAIL;
     }
 
     bsp_sdcard = card;
-    bsp_sd_uses_offset_diskio = true;
+    bsp_sd_uses_partition_diskio = true;
     ESP_LOGI(TAG,
-             "SD card mounted at %s via BSP offset fallback (%s %s, start_lba=%" PRIu32 ", sectors=%" PRIu32 ")",
+             "SD card mounted at %s via BSP partition-aware mount (%s %s, start_lba=%" PRIu32 ", sectors=%" PRIu32 ")",
              BSP_SD_MOUNT_POINT,
              bsp_sd_layout_name(volume->layout),
              bsp_sd_fs_name(volume->fs_type),
@@ -1339,9 +1354,13 @@ static esp_err_t bsp_mount_initialized_sd_card_with_offset(sdmmc_card_t *card,
     return ESP_OK;
 }
 
-static esp_err_t bsp_sdcard_mount_offset_fallback(uint8_t bus_width,
-                                                 const esp_vfs_fat_mount_config_t *mount_config)
+static esp_err_t bsp_sdcard_mount_partition_aware(uint8_t bus_width,
+                                                  const esp_vfs_fat_mount_config_t *mount_config)
 {
+    if (mount_config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     sdmmc_card_t *card = NULL;
     esp_err_t err = bsp_init_sdmmc_card_with_width(bus_width, &card);
     if (err != ESP_OK) {
@@ -1351,11 +1370,15 @@ static esp_err_t bsp_sdcard_mount_offset_fallback(uint8_t bus_width,
     bsp_sd_volume_t volume = {0};
     err = bsp_probe_sd_volume(card, &volume);
     if (err == ESP_OK) {
-        err = bsp_mount_initialized_sd_card_with_offset(card, &volume, mount_config);
+        err = bsp_mount_initialized_sd_card_partition(card, &volume, mount_config);
     }
 
     if (err != ESP_OK) {
-        bsp_cleanup_offset_mount(card);
+        if (mount_config->format_if_mount_failed) {
+            ESP_LOGW(TAG,
+                     "SD auto-format is not supported by BSP partition-aware mount");
+        }
+        bsp_cleanup_partition_mount(card);
     }
     return err;
 }
@@ -1364,19 +1387,10 @@ esp_err_t bsp_sdcard_sdmmc_mount(bsp_sdcard_cfg_t *cfg)
 {
     sdmmc_host_t sdhost = {0};
     sdmmc_slot_config_t sdslot = {0};
-    const esp_vfs_fat_sdmmc_mount_config_t mount_config = {
-#ifdef CONFIG_BSP_SD_FORMAT_ON_MOUNT_FAIL
-        .format_if_mount_failed = true,
-#else
-        .format_if_mount_failed = false,
-#endif
-        .max_files = 10,
-        .allocation_unit_size = 16 * 1024
-    };
     assert(cfg);
 
     if (!cfg->mount) {
-        cfg->mount = &mount_config;
+        cfg->mount = bsp_sdcard_default_mount_config();
     }
 
     if (!cfg->host) {
@@ -1404,8 +1418,7 @@ esp_err_t bsp_sdcard_sdspi_mount(bsp_sdcard_cfg_t *cfg)
 
 esp_err_t bsp_sdcard_mount(void)
 {
-    bsp_sdcard_cfg_t cfg = {0};
-    return bsp_sdcard_sdmmc_mount(&cfg);
+    return bsp_sdcard_mount_with_width(4, bsp_sdcard_default_mount_config());
 }
 
 esp_err_t bsp_sdcard_mount_with_width(uint8_t bus_width,
@@ -1415,45 +1428,21 @@ esp_err_t bsp_sdcard_mount_with_width(uint8_t bus_width,
         return ESP_ERR_INVALID_ARG;
     }
 
-    sdmmc_host_t host = {0};
-    sdmmc_slot_config_t slot = {0};
-    bsp_sdcard_get_sdmmc_host(SDMMC_HOST_SLOT_0, &host);
-    bsp_sdcard_sdmmc_get_slot(SDMMC_HOST_SLOT_0, &slot);
-    slot.width = bus_width;
+    const esp_vfs_fat_sdmmc_mount_config_t *active_mount_config =
+        mount_config ? mount_config : bsp_sdcard_default_mount_config();
 
-    bsp_sdcard_cfg_t cfg = {
-        .mount = mount_config,
-        .host = &host,
-        .slot = {
-            .sdmmc = &slot,
-        },
-    };
-    esp_err_t err = bsp_sdcard_sdmmc_mount(&cfg);
-    if (err == ESP_OK) {
-        bsp_sd_uses_offset_diskio = false;
-        return ESP_OK;
+    esp_err_t err = bsp_sdcard_mount_partition_aware(bus_width, active_mount_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SDMMC %u-bit partition-aware mount failed: %s",
+                 (unsigned)bus_width, esp_err_to_name(err));
     }
-
-    ESP_LOGW(TAG,
-             "SDMMC %u-bit mount through esp_vfs_fat_sdmmc_mount failed: %s; trying BSP offset fallback",
-             (unsigned)bus_width,
-             esp_err_to_name(err));
-    esp_err_t fallback_err = bsp_sdcard_mount_offset_fallback(bus_width, mount_config);
-    if (fallback_err == ESP_OK) {
-        return ESP_OK;
-    }
-
-    ESP_LOGW(TAG,
-             "SDMMC %u-bit offset fallback failed: %s",
-             (unsigned)bus_width,
-             esp_err_to_name(fallback_err));
     return err;
 }
 
 esp_err_t bsp_sdcard_unmount(void)
 {
-    if (bsp_sd_uses_offset_diskio) {
-        bsp_cleanup_offset_mount(bsp_sdcard);
+    if (bsp_sd_uses_partition_diskio) {
+        bsp_cleanup_partition_mount(bsp_sdcard);
         return ESP_OK;
     }
 
