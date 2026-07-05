@@ -567,6 +567,14 @@ esp_err_t bsp_i2c_init(void)
         .master.clk_speed = CONFIG_BSP_I2C_CLK_SPEED_HZ,
     };
     i2c_bus = i2c_bus_create(BSP_I2C_NUM, &conf);
+    if (i2c_bus == NULL) {
+        ESP_LOGE(TAG, "Failed to create i2c_bus wrapper");
+        if (i2c_handle != NULL) {
+            i2c_del_master_bus(i2c_handle);
+            i2c_handle = NULL;
+        }
+        return ESP_FAIL;
+    }
 
     //i2c_handle = i2c_bus_get_internal_bus_handle(i2c_bus);
     i2c_initialized = true;
@@ -576,7 +584,14 @@ esp_err_t bsp_i2c_init(void)
 
 esp_err_t bsp_i2c_deinit(void)
 {
-    BSP_ERROR_CHECK_RETURN_ERR(i2c_del_master_bus(i2c_handle));
+    esp_err_t ret = ESP_OK;
+    if (i2c_bus != NULL) {
+        ret = i2c_bus_delete(&i2c_bus);
+    } else if (i2c_handle != NULL) {
+        ret = i2c_del_master_bus(i2c_handle);
+    }
+    BSP_ERROR_CHECK_RETURN_ERR(ret);
+    i2c_handle = NULL;
     i2c_initialized = false;
     return ESP_OK;
 }
@@ -1492,10 +1507,13 @@ esp_err_t bsp_audio_init(const i2s_std_config_t *i2s_config)
 err:
     if (i2s_tx_chan) {
         i2s_del_channel(i2s_tx_chan);
+        i2s_tx_chan = NULL;
     }
     if (i2s_rx_chan) {
         i2s_del_channel(i2s_rx_chan);
+        i2s_rx_chan = NULL;
     }
+    i2s_data_if = NULL;
 
     return ret;
 }
@@ -1592,6 +1610,13 @@ esp_codec_dev_handle_t bsp_audio_codec_microphone_init(void)
 
 esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_handle_t *ret_panel, esp_lcd_panel_io_handle_t *ret_io)
 {
+    (void)config;
+    if (ret_panel == NULL || ret_io == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *ret_panel = NULL;
+    *ret_io = NULL;
+
     // reset lcd
     gpio_config_t ioconf = {
         .pin_bit_mask = 1ULL << BSP_LCD_RST,
@@ -1600,11 +1625,11 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&ioconf);
+    ESP_RETURN_ON_ERROR(gpio_config(&ioconf), TAG, "LCD reset GPIO config failed");
 
-    gpio_set_level(BSP_LCD_RST,0);
+    ESP_RETURN_ON_ERROR(gpio_set_level(BSP_LCD_RST, 0), TAG, "LCD reset low failed");
     vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level(BSP_LCD_RST,1);
+    ESP_RETURN_ON_ERROR(gpio_set_level(BSP_LCD_RST, 1), TAG, "LCD reset high failed");
     vTaskDelay(pdMS_TO_TICKS(10));
 
     esp_err_t ret = ESP_OK;
@@ -1667,11 +1692,11 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
     lcd_cmd &= 0xff;
     lcd_cmd <<= 8;
     lcd_cmd |= LCD_OPCODE_READ_CMD << 24;  // Use the read opcode instead of write
-    ret = esp_lcd_panel_io_rx_param(*ret_io, lcd_cmd, register_data, param_size); 
-    if (ret == ESP_OK) {
+    esp_err_t probe_ret = esp_lcd_panel_io_rx_param(*ret_io, lcd_cmd, register_data, param_size);
+    if (probe_ret == ESP_OK) {
         printf("Register 0x04 data: %02x %02x %02x %02x\n", register_data[0], register_data[1], register_data[2], register_data[3]);
     } else {
-        printf("Failed to read register 0x04, error code: %d\n", ret);
+        printf("Failed to read register 0x04, error code: %d\n", probe_ret);
     } 
 
     ESP_GOTO_ON_ERROR(esp_lcd_panel_io_del(*ret_io), err, TAG, "Delete probe panel IO failed");
@@ -1703,11 +1728,11 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
         },                                                            
         .vendor_config = (void *) &vendor_config,                                  
     };
-    esp_lcd_new_panel_st77916(*ret_io, &panel_config, ret_panel);
+    ESP_GOTO_ON_ERROR(esp_lcd_new_panel_st77916(*ret_io, &panel_config, ret_panel), err, TAG, "New ST77916 panel failed");
 
-    esp_lcd_panel_reset(*ret_panel);
-    esp_lcd_panel_init(*ret_panel);
-    esp_lcd_panel_disp_on_off(*ret_panel, true);
+    ESP_GOTO_ON_ERROR(esp_lcd_panel_reset(*ret_panel), err, TAG, "LCD panel reset failed");
+    ESP_GOTO_ON_ERROR(esp_lcd_panel_init(*ret_panel), err, TAG, "LCD panel init failed");
+    ESP_GOTO_ON_ERROR(esp_lcd_panel_disp_on_off(*ret_panel, true), err, TAG, "LCD panel display on failed");
 
     //esp_lcd_panel_swap_xy(*ret_panel, true);
     //esp_lcd_panel_mirror(*ret_panel,true,false);
@@ -1716,9 +1741,11 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
 err:
     if (*ret_panel) {
         esp_lcd_panel_del(*ret_panel);
+        *ret_panel = NULL;
     }
     if (*ret_io) {
         esp_lcd_panel_io_del(*ret_io);
+        *ret_io = NULL;
     }
     spi_bus_free(BSP_LCD_SPI_NUM);
     return ret;
@@ -1726,13 +1753,16 @@ err:
 
 esp_err_t bsp_touch_new(const bsp_display_cfg_t *cfg, esp_lcd_touch_handle_t *ret_touch)
 {
-    assert(cfg != NULL);
+    if (cfg == NULL || ret_touch == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *ret_touch = NULL;
     /* Initilize I2C */
     BSP_ERROR_CHECK_RETURN_ERR(bsp_i2c_init());
 
 
     i2c_master_bus_handle_t i2c_handle = NULL;
-    i2c_master_get_bus_handle(BSP_I2C_NUM,  &i2c_handle);
+    ESP_RETURN_ON_ERROR(i2c_master_get_bus_handle(BSP_I2C_NUM,  &i2c_handle), TAG, "Get I2C bus handle failed");
 
     /* Initialize touch HW */
     const esp_lcd_touch_config_t tp_cfg = {
@@ -1754,8 +1784,14 @@ esp_err_t bsp_touch_new(const bsp_display_cfg_t *cfg, esp_lcd_touch_handle_t *re
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
     tp_io_config.scl_speed_hz = CONFIG_BSP_I2C_CLK_SPEED_HZ;
-    esp_lcd_new_panel_io_i2c((i2c_master_bus_handle_t)i2c_handle, &tp_io_config, &tp_io_handle);
-    return esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, ret_touch);
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_i2c((i2c_master_bus_handle_t)i2c_handle, &tp_io_config, &tp_io_handle),
+                        TAG,
+                        "New touch I2C panel IO failed");
+    esp_err_t ret = esp_lcd_touch_new_i2c_cst816s(tp_io_handle, &tp_cfg, ret_touch);
+    if (ret != ESP_OK && tp_io_handle != NULL) {
+        esp_lcd_panel_io_del(tp_io_handle);
+    }
+    return ret;
 }
 
 

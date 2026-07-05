@@ -8,7 +8,7 @@ dependencies:
     public: true
     version: ^0.3.*
   idf: '>=6.0'
-  lvgl/lvgl: '>=8,<10'
+  lvgl/lvgl: '>=9,<10'
   espressif/esp_lcd_st77916: ^2.0.1
   espressif/bq27220: ^0.1.1
   waveshare/pcf85063a: ^2.0.0

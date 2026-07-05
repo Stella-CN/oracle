@@ -30,6 +30,9 @@ static esp_console_repl_t *s_repl = NULL;
 
 static int cmd_free(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
+
     dbg_console_printf("internal: free %u KB, min %u KB, largest block %u KB\n",
                        (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
                        (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024),
@@ -43,6 +46,9 @@ static int cmd_free(int argc, char **argv)
 
 static int cmd_restart(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
+
     ESP_LOGW(TAG, "Restarting...");
     esp_restart();
     return 0;
@@ -50,6 +56,9 @@ static int cmd_restart(int argc, char **argv)
 
 static int cmd_version(int argc, char **argv)
 {
+    (void)argc;
+    (void)argv;
+
     const esp_app_desc_t *app = esp_app_get_description();
     esp_chip_info_t chip;
     esp_chip_info(&chip);
@@ -91,13 +100,32 @@ static int cmd_loglevel(int argc, char **argv)
     return 1;
 }
 
-static void register_system_cmds(void)
+static esp_err_t register_system_cmds(void)
 {
-    dbg_console_register_cmd("free", "Show free heap (internal & PSRAM)", NULL, cmd_free);
-    dbg_console_register_cmd("restart", "Software reset of the chip", NULL, cmd_restart);
-    dbg_console_register_cmd("version", "Show app/IDF/chip version", NULL, cmd_version);
-    dbg_console_register_cmd("loglevel", "Set log level of a tag",
-                             "<tag|*> <none|error|warn|info|debug|verbose>", cmd_loglevel);
+    esp_err_t ret = ESP_OK;
+    esp_err_t err = dbg_console_register_cmd("free",
+                                             "Show free heap (internal & PSRAM)",
+                                             NULL,
+                                             cmd_free);
+    if (err != ESP_OK && ret == ESP_OK) {
+        ret = err;
+    }
+    err = dbg_console_register_cmd("restart", "Software reset of the chip", NULL, cmd_restart);
+    if (err != ESP_OK && ret == ESP_OK) {
+        ret = err;
+    }
+    err = dbg_console_register_cmd("version", "Show app/IDF/chip version", NULL, cmd_version);
+    if (err != ESP_OK && ret == ESP_OK) {
+        ret = err;
+    }
+    err = dbg_console_register_cmd("loglevel",
+                                   "Set log level of a tag",
+                                   "<tag|*> <none|error|warn|info|debug|verbose>",
+                                   cmd_loglevel);
+    if (err != ESP_OK && ret == ESP_OK) {
+        ret = err;
+    }
+    return ret;
 }
 
 /* ---------------------------------------------------------------------------
@@ -107,6 +135,12 @@ static void register_system_cmds(void)
 esp_err_t dbg_console_register_cmd(const char *name, const char *help,
                                    const char *hint, dbg_console_cmd_func_t func)
 {
+    if (name == NULL || name[0] == '\0' || help == NULL || func == NULL) {
+        ESP_LOGE(TAG, "Invalid command registration: name=%p help=%p func=%p",
+                 name, help, func);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     const esp_console_cmd_t cmd = {
         .command = name,
         .help = help,
@@ -166,7 +200,13 @@ esp_err_t dbg_console_start(const dbg_console_config_t *config)
     }
 
     if (config->register_system_cmds) {
-        register_system_cmds();
+        err = register_system_cmds();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register system commands: %s", esp_err_to_name(err));
+            s_repl->del(s_repl);
+            s_repl = NULL;
+            return err;
+        }
     }
 
     if (config->register_user_cmds != NULL) {
